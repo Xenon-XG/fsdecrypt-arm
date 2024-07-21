@@ -1,0 +1,9 @@
+/target
+*.exe
+*.zip
+*.app
+*.opt
+*.vhd
+*.ntfs
+*.exfat
+flamegraph.svg
