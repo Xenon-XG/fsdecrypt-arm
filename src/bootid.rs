@@ -7,9 +7,9 @@ pub const BOOTID_IV: [u8; 16] = hex!("b155c22c2e7f0491fa7f0fdc217aff90");
 
 #[allow(non_snake_case)]
 pub mod ContainerType {
-    pub const OS: u16 = 0x0000;
-    pub const APP: u16 = 0x0101;
-    pub const OPTION: u16 = 0x0201;
+    pub const OS: u8 = 0x00;
+    pub const APP: u8 = 0x01;
+    pub const OPTION: u8 = 0x02;
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -55,7 +55,8 @@ pub struct BootId {
     pub crc32: u32,
     pub length: u32,
     pub signature: [u8; 4],
-    pub container_type: u16,
+    unk1: u8,
+    pub container_type: u8,
     pub sequence_number: u8,
     pub use_custom_iv: bool,
     pub game_id: [u8; 4],
@@ -64,7 +65,7 @@ pub struct BootId {
     pub block_count: u64,
     pub block_size: u64,
     pub header_block_count: u64,
-    unk1: u64,
+    unk2: u64,
     pub os_id: [u8; 3],
     pub os_generation: u8,
     pub source_timestamp: Timestamp,
