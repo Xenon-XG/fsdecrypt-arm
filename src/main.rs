@@ -1,9 +1,11 @@
 use std::{
-    fs::{create_dir_all, File},
+    fs::{create_dir_all, File, FileTimes},
     io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::Path,
+    time::{Duration, SystemTime},
 };
 
+use chrono::{FixedOffset, TimeZone};
 use exfat_fs::dir::{entry::fs::FsElement, Root};
 
 use aes::{
@@ -22,6 +24,29 @@ mod bootid;
 mod crypto;
 
 const PAGE_SIZE: u64 = 4096;
+
+fn exfat_timestamp_to_system_time(
+    timestamp: &exfat_fs::timestamp::Timestamp,
+) -> Result<SystemTime> {
+    let exfat_date = timestamp.date();
+    let exfat_time = timestamp.time();
+    // exFAT UTC offset is in 15-minute intervals, so 1 = UTC+00:15, 2 = UTC+00:30, etc.
+    let exfat_utc_offset = timestamp.utc_offset() as i32 * 15 * 60;
+    let chrono_date_time = FixedOffset::east_opt(exfat_utc_offset)
+        .ok_or_else(|| anyhow!("invaid utc offset: {}", timestamp.utc_offset()))?
+        .with_ymd_and_hms(
+            exfat_date.year as i32,
+            exfat_date.month as u32,
+            exfat_date.day as u32,
+            exfat_time.hour as u32,
+            exfat_time.minute as u32,
+            exfat_time.second as u32,
+        )
+        .unwrap();
+
+    return Ok(SystemTime::UNIX_EPOCH
+        + Duration::from_micros(chrono_date_time.timestamp_micros().try_into()?));
+}
 
 fn extract_exfat_contents(exfat_path: &Path) -> Result<()> {
     println!("Extracting contents of {}", exfat_path.display());
@@ -46,6 +71,16 @@ fn extract_fs_elements(elements: &mut [FsElement<File>], output_dir: &Path) -> R
                 let mut dest = File::create(dest_path)?;
 
                 std::io::copy(file, &mut dest)?;
+
+                dest.set_times(
+                    FileTimes::new()
+                        .set_accessed(exfat_timestamp_to_system_time(
+                            file.timestamps().accessed(),
+                        )?)
+                        .set_modified(exfat_timestamp_to_system_time(
+                            file.timestamps().modified(),
+                        )?),
+                )?;
             }
             FsElement::D(directory) => {
                 let dest_path = output_dir.join(directory.name());
