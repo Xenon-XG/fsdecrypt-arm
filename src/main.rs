@@ -1,8 +1,10 @@
 use std::{
-    fs::File,
+    fs::{create_dir_all, File},
     io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::Path,
 };
+
+use exfat_fs::dir::{entry::fs::FsElement, Root};
 
 use aes::{
     cipher::{block_padding::NoPadding, BlockDecryptMut, InnerIvInit, KeyInit, KeyIvInit},
@@ -20,6 +22,43 @@ mod bootid;
 mod crypto;
 
 const PAGE_SIZE: u64 = 4096;
+
+fn extract_exfat_contents(exfat_path: &Path) -> Result<()> {
+    println!("Extracting contents of {}", exfat_path.display());
+
+    let file = File::open(exfat_path)?;
+    let mut root = Root::open(file)?;
+
+    // Create output directory with same name as exfat file (without extension)
+    let output_dir = exfat_path.with_extension("");
+
+    create_dir_all(&output_dir)?;
+    extract_fs_elements(root.items(), &output_dir)?;
+
+    Ok(())
+}
+
+fn extract_fs_elements(elements: &mut [FsElement<File>], output_dir: &Path) -> Result<()> {
+    for element in elements {
+        match element {
+            FsElement::F(ref mut file) => {
+                let dest_path = output_dir.join(file.name());
+                let mut dest = File::create(dest_path)?;
+
+                std::io::copy(file, &mut dest)?;
+            }
+            FsElement::D(directory) => {
+                let dest_path = output_dir.join(directory.name());
+                create_dir_all(&dest_path)?;
+
+                let mut children = directory.open()?;
+                extract_fs_elements(&mut children, &dest_path)?;
+            }
+        }
+    }
+
+    Ok(())
+}
 
 fn main() -> Result<()> {
     let args = std::env::args().collect::<Vec<String>>();
@@ -83,11 +122,7 @@ fn main() -> Result<()> {
 
         let data_offset = bootid.header_block_count * bootid.block_size;
         let key = keys.key;
-        let iv = if bootid.use_custom_iv {
-            None
-        } else {
-            keys.iv
-        };
+        let iv = if bootid.use_custom_iv { None } else { keys.iv };
         let iv = match iv {
             Some(iv) => iv,
             None => {
@@ -160,7 +195,7 @@ fn main() -> Result<()> {
                     .template("{prefix} [{bar:20!.bright.yellow/dim.white}] {bytes:>8} [{elapsed}<{eta}, {bytes_per_sec}]")?
             );
 
-        pb.set_prefix(output_filename);
+        pb.set_prefix(output_filename.clone());
         reader.seek(SeekFrom::Start(data_offset))?;
 
         for _ in 0..output_size / PAGE_SIZE {
@@ -183,6 +218,20 @@ fn main() -> Result<()> {
 
         writer.flush()?;
         pb.finish();
+
+        // Extract exfat contents if this is an exfat file
+        if bootid.container_type == ContainerType::OPTION
+            && output_path.extension().unwrap_or_default() == "exfat"
+        {
+            if let Err(e) = extract_exfat_contents(&output_path) {
+                println!("WARNING: Failed to extract exfat contents: {e:#?}");
+            } else {
+                println!("Extracted exfat contents: {:?}", output_path);
+                println!("Deleting exfat file: {:?}", output_path);
+
+                std::fs::remove_file(output_path)?;
+            }
+        }
 
         page.clear();
         page_iv.fill(0);
