@@ -1,11 +1,12 @@
 use std::{
     fs::{create_dir_all, File, FileTimes},
     io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
-    path::Path,
+    path::{Path, PathBuf},
     time::{Duration, SystemTime},
 };
 
 use chrono::{FixedOffset, TimeZone};
+use clap::Parser;
 use exfat_fs::dir::{entry::fs::FsElement, Root};
 
 use aes::{
@@ -19,6 +20,7 @@ use crypto::{
     NTFS_HEADER, OPTION_IV, OPTION_KEY,
 };
 use indicatif::{ProgressBar, ProgressStyle};
+use ntfs::{indexes::NtfsFileNameIndex, Ntfs};
 
 mod bootid;
 mod crypto;
@@ -58,12 +60,12 @@ fn extract_exfat_contents(exfat_path: &Path) -> Result<()> {
     let output_dir = exfat_path.with_extension("");
 
     create_dir_all(&output_dir)?;
-    extract_fs_elements(root.items(), &output_dir)?;
+    extract_exfat_elements(root.items(), &output_dir)?;
 
     Ok(())
 }
 
-fn extract_fs_elements(elements: &mut [FsElement<File>], output_dir: &Path) -> Result<()> {
+fn extract_exfat_elements(elements: &mut [FsElement<File>], output_dir: &Path) -> Result<()> {
     for element in elements {
         match element {
             FsElement::F(ref mut file) => {
@@ -87,7 +89,7 @@ fn extract_fs_elements(elements: &mut [FsElement<File>], output_dir: &Path) -> R
                 create_dir_all(&dest_path)?;
 
                 let mut children = directory.open()?;
-                extract_fs_elements(&mut children, &dest_path)?;
+                extract_exfat_elements(&mut children, &dest_path)?;
             }
         }
     }
@@ -95,13 +97,46 @@ fn extract_fs_elements(elements: &mut [FsElement<File>], output_dir: &Path) -> R
     Ok(())
 }
 
-fn main() -> Result<()> {
-    let args = std::env::args().collect::<Vec<String>>();
+fn extract_internal_vhd(image_path: &Path, sequence_number: u8) -> Result<PathBuf> {
+    let vhd_filename = format!("internal_{sequence_number}.vhd");
+    let output_path = image_path.with_extension("vhd");
 
-    if args.len() < 2 {
-        println!("Usage: fsdecrypt <input_file1> [<input_file2> ...]");
-        return Ok(());
-    }
+    let mut fs = File::open(image_path)?;
+
+    let mut ntfs = Ntfs::new(&mut fs)?;
+
+    ntfs.read_upcase_table(&mut fs)?;
+
+    let root_directory = ntfs.root_directory(&mut fs)?;
+    let index = root_directory.directory_index(&mut fs)?;
+    let mut finder = index.finder();
+    let entry = NtfsFileNameIndex::find(&mut finder, &ntfs, &mut fs, &vhd_filename)
+        .ok_or_else(|| anyhow!("could not find VHD {vhd_filename}"))??;
+    let file = entry.to_file(&ntfs, &mut fs)?;
+    let data_item = file
+        .data(&mut fs, "")
+        .ok_or_else(|| anyhow!("file data does not exist"))??;
+    let data_attribute = data_item.to_attribute()?;
+    let mut data_value = data_attribute.value(&mut fs)?.attach(&mut fs);
+
+    let mut output_file = File::create(&output_path)?;
+    std::io::copy(&mut data_value, &mut output_file)?;
+
+    Ok(output_path)
+}
+
+#[derive(Parser)]
+#[command(version, about = "decryptor for some SEGA containers", long_about = None)]
+struct Cli {
+    #[arg(long, help = "do not extract contents of decrypted image")]
+    no_extract: bool,
+
+    #[arg(required = true)]
+    files: Vec<PathBuf>,
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
 
     let bootid_cipher =
         Aes128CbcDec::new_from_slices(&BOOTID_KEY, &BOOTID_IV).map_err(|e| anyhow!(e))?;
@@ -109,8 +144,7 @@ fn main() -> Result<()> {
     let mut page: Vec<u8> = Vec::with_capacity(PAGE_SIZE as usize);
     let mut page_iv = [0u8; 16];
 
-    for path in args.iter().skip(1) {
-        let path = Path::new(path);
+    for path in &cli.files {
         let file = File::open(path)?;
         let mut reader = BufReader::with_capacity(0x40000, file);
 
@@ -254,17 +288,35 @@ fn main() -> Result<()> {
         writer.flush()?;
         pb.finish();
 
-        // Extract exfat contents if this is an exfat file
-        if bootid.container_type == ContainerType::OPTION
-            && output_path.extension().unwrap_or_default() == "exfat"
-        {
-            if let Err(e) = extract_exfat_contents(&output_path) {
-                println!("WARNING: Failed to extract exfat contents: {e:#?}");
-            } else {
-                println!("Extracted exfat contents: {:?}", output_path);
-                println!("Deleting exfat file: {:?}", output_path);
+        if !cli.no_extract {
+            match bootid.container_type {
+                ContainerType::OS | ContainerType::APP => {
+                    match extract_internal_vhd(&output_path, bootid.sequence_number) {
+                        Ok(extracted_path) => {
+                            println!("Extracted internal VHD: {}", extracted_path.display());
+                            println!("Deleting original NTFS image: {}", output_path.display());
 
-                std::fs::remove_file(output_path)?;
+                            std::fs::remove_file(output_path)?;
+                        }
+                        Err(e) => {
+                            println!("WARNING: Failed to extract internal VHD: {e:#?}");
+                        }
+                    }
+                }
+                ContainerType::OPTION => match extract_exfat_contents(&output_path) {
+                    Ok(_) => {
+                        println!("Extracted exfat contents: {}", output_path.display());
+                        println!("Deleting exfat file: {}", output_path.display());
+
+                        std::fs::remove_file(output_path)?;
+                    }
+                    Err(e) => {
+                        println!("WARNING: Failed to extract exfat contents: {e:#?}");
+                    }
+                },
+                _ => {
+                    println!("WARNING: Unknown container type: {}", bootid.container_type);
+                }
             }
         }
 

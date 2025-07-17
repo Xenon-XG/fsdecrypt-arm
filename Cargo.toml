@@ -1,6 +1,6 @@
 [package]
 name = "fsdecrypt"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 
 [dependencies]
@@ -12,3 +12,5 @@ hex-literal = "0.4.1"
 indicatif = "0.17.8"
 exfat-fs = "0.1.3"
 chrono = "0.4.41"
+clap = { version = "4.5.41", features = ["derive"] }
+ntfs = "0.4.0"
