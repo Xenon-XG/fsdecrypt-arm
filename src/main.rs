@@ -20,7 +20,10 @@ use crypto::{
     NTFS_HEADER, OPTION_IV, OPTION_KEY,
 };
 use indicatif::{ProgressBar, ProgressStyle};
-use ntfs::{indexes::NtfsFileNameIndex, Ntfs};
+use ntfs::{
+    indexes::NtfsFileNameIndex, structured_values::NtfsStandardInformation, Ntfs,
+    NtfsAttributeType, NtfsTime,
+};
 
 mod bootid;
 mod crypto;
@@ -51,16 +54,25 @@ fn exfat_timestamp_to_system_time(
 }
 
 fn extract_exfat_contents(exfat_path: &Path) -> Result<()> {
-    println!("Extracting contents of {}", exfat_path.display());
+    // Create output directory with same name as exfat file (without extension)
+    let output_dir = exfat_path.with_extension("");
+
+    let pb = ProgressBar::new_spinner()
+        .with_style(ProgressStyle::default_bar().template("{prefix} {spinner}")?);
+    pb.set_prefix(format!(
+        "Extracting contents of {} to {}",
+        exfat_path.file_name().unwrap().display(),
+        output_dir.display(),
+    ));
+    pb.enable_steady_tick(Duration::from_millis(100));
 
     let file = File::open(exfat_path)?;
     let mut root = Root::open(file)?;
 
-    // Create output directory with same name as exfat file (without extension)
-    let output_dir = exfat_path.with_extension("");
-
     create_dir_all(&output_dir)?;
     extract_exfat_elements(root.items(), &output_dir)?;
+
+    pb.finish();
 
     Ok(())
 }
@@ -97,6 +109,16 @@ fn extract_exfat_elements(elements: &mut [FsElement<File>], output_dir: &Path) -
     Ok(())
 }
 
+fn ntfs_time_to_system_time(ntfs_time: NtfsTime) -> SystemTime {
+    // An NTFS "interval" is 100 nanoseconds.
+    // The Windows epoch is 1601-01-01, while the Unix epoch is 1970-01-01.
+    let intervals_since_windows_epoch = ntfs_time.nt_timestamp();
+    let intervals_since_unix_epoch = intervals_since_windows_epoch - 116_444_736_000_000_000;
+    let nanos_since_unix_epoch = intervals_since_unix_epoch * 100;
+
+    return SystemTime::UNIX_EPOCH + Duration::from_nanos(nanos_since_unix_epoch);
+}
+
 fn extract_internal_vhd(image_path: &Path, sequence_number: u8) -> Result<PathBuf> {
     let vhd_filename = format!("internal_{sequence_number}.vhd");
     let output_path = image_path.with_extension("vhd");
@@ -120,7 +142,40 @@ fn extract_internal_vhd(image_path: &Path, sequence_number: u8) -> Result<PathBu
     let mut data_value = data_attribute.value(&mut fs)?.attach(&mut fs);
 
     let mut output_file = File::create(&output_path)?;
+
+    let pb = ProgressBar::new_spinner()
+        .with_style(ProgressStyle::default_bar().template("{prefix} {spinner}")?);
+    pb.set_prefix(format!(
+        "Extracting {} from NTFS image",
+        output_path.file_name().unwrap().display()
+    ));
+    pb.enable_steady_tick(Duration::from_millis(100));
+
     std::io::copy(&mut data_value, &mut output_file)?;
+
+    pb.finish();
+
+    let mut attributes_iterator = file.attributes();
+
+    while let Some(attribute) = attributes_iterator.next(&mut fs) {
+        let attribute = attribute?;
+        let attribute = attribute.to_attribute()?;
+
+        match attribute.ty() {
+            Ok(NtfsAttributeType::StandardInformation) => {
+                let info = attribute.resident_structured_value::<NtfsStandardInformation>()?;
+
+                output_file.set_times(
+                    FileTimes::new()
+                        .set_accessed(ntfs_time_to_system_time(info.access_time()))
+                        .set_modified(ntfs_time_to_system_time(info.modification_time())),
+                )?;
+
+                break;
+            }
+            _ => continue,
+        }
+    }
 
     Ok(output_path)
 }
@@ -292,10 +347,8 @@ fn main() -> Result<()> {
             match bootid.container_type {
                 ContainerType::OS | ContainerType::APP => {
                     match extract_internal_vhd(&output_path, bootid.sequence_number) {
-                        Ok(extracted_path) => {
-                            println!("Extracted internal VHD: {}", extracted_path.display());
-                            println!("Deleting original NTFS image: {}", output_path.display());
-
+                        Ok(_) => {
+                            println!("Deleting NTFS image: {}", output_path.display());
                             std::fs::remove_file(output_path)?;
                         }
                         Err(e) => {
@@ -305,8 +358,7 @@ fn main() -> Result<()> {
                 }
                 ContainerType::OPTION => match extract_exfat_contents(&output_path) {
                     Ok(_) => {
-                        println!("Extracted exfat contents: {}", output_path.display());
-                        println!("Deleting exfat file: {}", output_path.display());
+                        println!("Deleting exFAT image: {}", output_path.display());
 
                         std::fs::remove_file(output_path)?;
                     }
