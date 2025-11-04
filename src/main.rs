@@ -142,6 +142,7 @@ fn extract_internal_vhd(image_path: &Path, sequence_number: u8) -> Result<PathBu
     let mut data_value = data_attribute.value(&mut fs)?.attach(&mut fs);
 
     let mut output_file = File::create(&output_path)?;
+    let mut writer = BufWriter::with_capacity(256 * 1024, &mut output_file);
 
     let pb = ProgressBar::new_spinner()
         .with_style(ProgressStyle::default_bar().template("{prefix} {spinner}")?);
@@ -151,7 +152,9 @@ fn extract_internal_vhd(image_path: &Path, sequence_number: u8) -> Result<PathBu
     ));
     pb.enable_steady_tick(Duration::from_millis(100));
 
-    std::io::copy(&mut data_value, &mut output_file)?;
+    std::io::copy(&mut data_value, &mut writer)?;
+    writer.flush()?;
+    drop(writer);
 
     pb.finish();
 
