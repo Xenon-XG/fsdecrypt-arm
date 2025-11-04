@@ -84,8 +84,6 @@ fn extract_exfat_elements(elements: &mut [FsElement<File>], output_dir: &Path) -
                 let dest_path = output_dir.join(file.name());
                 let mut dest = File::create(dest_path)?;
 
-                std::io::copy(file, &mut dest)?;
-
                 dest.set_times(
                     FileTimes::new()
                         .set_accessed(exfat_timestamp_to_system_time(
@@ -95,6 +93,10 @@ fn extract_exfat_elements(elements: &mut [FsElement<File>], output_dir: &Path) -
                             file.timestamps().modified(),
                         )?),
                 )?;
+
+                let mut writer = BufWriter::with_capacity(256 * 1024, &mut dest);
+
+                std::io::copy(file, &mut writer)?;
             }
             FsElement::D(directory) => {
                 let dest_path = output_dir.join(directory.name());
