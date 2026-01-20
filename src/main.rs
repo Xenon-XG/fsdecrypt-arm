@@ -1,6 +1,6 @@
 use std::{
     fs::{create_dir_all, File, FileTimes},
-    io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
+    io::{BufRead, BufReader, BufWriter, Write},
     path::{Path, PathBuf},
     time::{Duration, SystemTime},
 };
@@ -9,26 +9,19 @@ use chrono::{FixedOffset, TimeZone};
 use clap::Parser;
 use exfat_fs::dir::{entry::fs::FsElement, Root};
 
-use aes::{
-    cipher::{block_padding::NoPadding, BlockDecryptMut, InnerIvInit, KeyInit, KeyIvInit},
-    Aes128Dec,
-};
 use anyhow::{anyhow, Result};
-use bootid::{BootId, ContainerType, BOOTID_IV, BOOTID_KEY};
-use crypto::{
-    calculate_file_iv, calculate_page_iv, get_game_keys, Aes128CbcDec, GameKeys, EXFAT_HEADER,
-    NTFS_HEADER, OPTION_IV, OPTION_KEY,
-};
+use bootid::ContainerType;
 use indicatif::{ProgressBar, ProgressStyle};
 use ntfs::{
     indexes::NtfsFileNameIndex, structured_values::NtfsStandardInformation, Ntfs,
     NtfsAttributeType, NtfsTime,
 };
 
+use crate::stream::FscryptDecryptor;
+
 mod bootid;
 mod crypto;
-
-const PAGE_SIZE: u64 = 4096;
+mod stream;
 
 fn exfat_timestamp_to_system_time(
     timestamp: &exfat_fs::timestamp::Timestamp,
@@ -125,7 +118,7 @@ fn extract_internal_vhd(image_path: &Path, sequence_number: u8) -> Result<PathBu
     let vhd_filename = format!("internal_{sequence_number}.vhd");
     let output_path = image_path.with_extension("vhd");
 
-    let mut fs = File::open(image_path)?;
+    let mut fs = FscryptDecryptor::new(File::open(image_path)?).map_err(|e| anyhow!(e))?;
 
     let mut ntfs = Ntfs::new(&mut fs)?;
 
@@ -141,22 +134,31 @@ fn extract_internal_vhd(image_path: &Path, sequence_number: u8) -> Result<PathBu
         .data(&mut fs, "")
         .ok_or_else(|| anyhow!("file data does not exist"))??;
     let data_attribute = data_item.to_attribute()?;
-    let mut data_value = data_attribute.value(&mut fs)?.attach(&mut fs);
+    let mut data_value =
+        BufReader::with_capacity(256 * 1024, data_attribute.value(&mut fs)?.attach(&mut fs));
 
     let mut output_file = File::create(&output_path)?;
-    let mut writer = BufWriter::with_capacity(256 * 1024, &mut output_file);
 
-    let pb = ProgressBar::new_spinner()
-        .with_style(ProgressStyle::default_bar().template("{prefix} {spinner}")?);
-    pb.set_prefix(format!(
-        "Extracting {} from NTFS image",
-        output_path.file_name().unwrap().display()
-    ));
-    pb.enable_steady_tick(Duration::from_millis(100));
+    let pb = ProgressBar::new(data_attribute.value_length() as u64)
+        .with_style(
+            ProgressStyle::default_bar()
+                .template("{prefix} [{bar:20!.bright.yellow/dim.white}] {bytes:>8} [{elapsed}<{eta}, {bytes_per_sec}]")?
+        );
+    pb.set_prefix(format!("{}", output_path.file_name().unwrap().display()));
 
-    std::io::copy(&mut data_value, &mut writer)?;
-    writer.flush()?;
-    drop(writer);
+    loop {
+        let buffer = data_value.fill_buf()?;
+        let length = buffer.len();
+
+        if length == 0 {
+            break;
+        }
+
+        output_file.write_all(buffer)?;
+        data_value.consume(length);
+        pb.inc(length as u64);
+    }
+    output_file.flush()?;
 
     pb.finish();
 
@@ -198,164 +200,49 @@ struct Cli {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    let bootid_cipher =
-        Aes128CbcDec::new_from_slices(&BOOTID_KEY, &BOOTID_IV).map_err(|e| anyhow!(e))?;
-    let mut bootid_bytes = [0u8; std::mem::size_of::<BootId>()];
-    let mut page: Vec<u8> = Vec::with_capacity(PAGE_SIZE as usize);
-    let mut page_iv = [0u8; 16];
-
     for path in &cli.files {
-        let file = File::open(path)?;
-        let mut reader = BufReader::with_capacity(0x40000, file);
-
-        reader.read_exact(&mut bootid_bytes)?;
-
-        if let Err(e) = bootid_cipher
-            .clone()
-            .decrypt_padded_mut::<NoPadding>(&mut bootid_bytes)
-        {
-            println!("ERROR: Could not decrypt BootID: {e:#?}");
-            continue;
-        }
-
-        let bootid = unsafe { std::mem::transmute::<[u8; 96], BootId>(bootid_bytes) };
-
-        if bootid.container_type != ContainerType::OS
-            && bootid.container_type != ContainerType::APP
-            && bootid.container_type != ContainerType::OPTION
-        {
-            println!("ERROR: Unknown container type {}", bootid.container_type);
-            continue;
-        }
-
-        let os_id = std::str::from_utf8(&bootid.os_id)?;
-        let game_id = std::str::from_utf8(&bootid.game_id)?;
-        let id = match bootid.container_type {
-            ContainerType::OS => os_id,
-            _ => game_id,
-        };
-
-        let keys = match bootid.container_type {
-            ContainerType::OS => get_game_keys(os_id),
-            ContainerType::APP => get_game_keys(game_id),
-            _ => Some(GameKeys {
-                key: OPTION_KEY,
-                iv: Some(OPTION_IV),
-            }),
-        };
-
-        let Some(keys) = keys else {
-            println!("ERROR: Key not found for {id}. If you're using a custom key file, ensure the key file is 16/32 bytes and named {id}.bin.");
-            continue;
-        };
-
-        let data_offset = bootid.header_block_count * bootid.block_size;
-        let key = keys.key;
-        let iv = if bootid.use_custom_iv { None } else { keys.iv };
-        let iv = match iv {
-            Some(iv) => iv,
-            None => {
-                reader.seek(SeekFrom::Start(data_offset))?;
-
-                let reference = Read::by_ref(&mut reader);
-
-                reference.take(4096).read_to_end(&mut page)?;
-
-                if bootid.container_type == ContainerType::OPTION {
-                    calculate_file_iv(key, EXFAT_HEADER, &page)?
-                } else {
-                    calculate_file_iv(key, NTFS_HEADER, &page)?
-                }
-            }
-        };
-
-        let output_filename = match bootid.container_type {
-            ContainerType::OS => format!(
-                "{os_id}_{:<04}.{:<02}.{:<02}_{}_{}.ntfs",
-                bootid.os_version.major,
-                bootid.os_version.minor,
-                bootid.os_version.release,
-                bootid.target_timestamp,
-                bootid.sequence_number
-            ),
-            ContainerType::APP => {
-                if bootid.sequence_number > 0 {
-                    format!(
-                        "{game_id}_{}.{:<02}.{:<02}_{}_{}_{}.{:<02}.{:<02}.ntfs",
-                        unsafe { bootid.target_version.version.major },
-                        unsafe { bootid.target_version.version.minor },
-                        unsafe { bootid.target_version.version.release },
-                        bootid.target_timestamp,
-                        bootid.sequence_number,
-                        bootid.source_version.major,
-                        bootid.source_version.minor,
-                        bootid.source_version.release,
-                    )
-                } else {
-                    format!(
-                        "{game_id}_{}.{:<02}.{:<02}_{}_{}.ntfs",
-                        unsafe { bootid.target_version.version.major },
-                        unsafe { bootid.target_version.version.minor },
-                        unsafe { bootid.target_version.version.release },
-                        bootid.target_timestamp,
-                        bootid.sequence_number,
-                    )
-                }
-            }
-            _ => format!(
-                "{game_id}_{}_{}_{}.exfat",
-                unsafe { std::str::from_utf8(&bootid.target_version.option)? },
-                bootid.target_timestamp,
-                bootid.sequence_number,
-            ),
-        };
+        let file = FscryptDecryptor::new(File::open(path)?).map_err(|e| anyhow!(e))?;
+        let bootid = file.bootid.clone();
+        let output_filename = file.filename()?;
         let output_path = path.with_file_name(&output_filename);
-        let output_file = File::create(&output_path)?;
-        let output_size = (bootid.block_count - bootid.header_block_count) * bootid.block_size;
 
-        output_file.set_len(output_size)?;
+        // Can't directly extract options since we can't impl exfat_fs::dir::ReadOffset
+        // for our wrapper decryptor
+        if cli.no_extract || file.bootid.container_type == ContainerType::OPTION {
+            let mut output_file = File::create(&output_path)?;
 
-        let mut writer = BufWriter::with_capacity(0x40000, output_file);
-        let cipher = Aes128Dec::new_from_slice(&key).map_err(|e| anyhow!(e))?;
+            output_file.set_len(file.len())?;
 
-        let pb = ProgressBar::new(output_size)
-            .with_style(
-                ProgressStyle::default_bar()
-                    .template("{prefix} [{bar:20!.bright.yellow/dim.white}] {bytes:>8} [{elapsed}<{eta}, {bytes_per_sec}]")?
-            );
+            let pb = ProgressBar::new(file.len())
+                .with_style(
+                    ProgressStyle::default_bar()
+                        .template("{prefix} [{bar:20!.bright.yellow/dim.white}] {bytes:>8} [{elapsed}<{eta}, {bytes_per_sec}]")?
+                );
 
-        pb.set_prefix(output_filename.clone());
-        reader.seek(SeekFrom::Start(data_offset))?;
+            pb.set_prefix(output_filename.clone());
 
-        for _ in 0..output_size / PAGE_SIZE {
-            let file_offset = reader.stream_position()? - data_offset;
-            let reference = Read::by_ref(&mut reader);
+            let mut reader = BufReader::with_capacity(0x40000, file);
 
-            calculate_page_iv(file_offset, &iv, &mut page_iv);
-            page.clear();
-            reference.take(PAGE_SIZE).read_to_end(&mut page)?;
+            loop {
+                let buffer = reader.fill_buf()?;
+                let length = buffer.len();
 
-            let page_cipher = Aes128CbcDec::inner_iv_slice_init(cipher.clone(), &page_iv)
-                .map_err(|e| anyhow!(e))?;
-            page_cipher
-                .decrypt_padded_mut::<NoPadding>(&mut page)
-                .map_err(|e| anyhow!(e))?;
+                if length == 0 {
+                    break;
+                }
 
-            writer.write_all(&page)?;
-            pb.inc(PAGE_SIZE);
+                output_file.write_all(&buffer)?;
+                reader.consume(length);
+
+                pb.inc(length as u64);
+            }
         }
-
-        writer.flush()?;
-        pb.finish();
 
         if !cli.no_extract {
             match bootid.container_type {
                 ContainerType::OS | ContainerType::APP => {
-                    match extract_internal_vhd(&output_path, bootid.sequence_number) {
-                        Ok(_) => {
-                            println!("Deleting NTFS image: {}", output_path.display());
-                            std::fs::remove_file(output_path)?;
-                        }
+                    match extract_internal_vhd(&path, bootid.sequence_number) {
+                        Ok(_) => {}
                         Err(e) => {
                             println!("WARNING: Failed to extract internal VHD: {e:#?}");
                         }
@@ -376,10 +263,6 @@ fn main() -> Result<()> {
                 }
             }
         }
-
-        page.clear();
-        page_iv.fill(0);
-        bootid_bytes.fill(0);
     }
 
     Ok(())

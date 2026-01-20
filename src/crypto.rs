@@ -12,6 +12,7 @@ pub const OPTION_IV: [u8; 16] = hex!("c063bf6f562d084d7963c987f5281761");
 
 pub type Aes128CbcDec = cbc::Decryptor<aes::Aes128Dec>;
 
+#[derive(Debug, Clone, Copy)]
 pub struct GameKeys {
     pub key: [u8; 16],
     pub iv: Option<[u8; 16]>,
