@@ -1,4 +1,5 @@
 use std::{
+    fs::File,
     io::{self, Read, Seek, SeekFrom},
     str::Utf8Error,
 };
@@ -8,6 +9,7 @@ use aes::cipher::{
     BlockDecryptMut, InvalidLength,
 };
 use cipher::KeyIvInit;
+use exfat_fs::disk::ReadOffset;
 
 use crate::{
     bootid::{BootId, ContainerType, BOOTID_IV, BOOTID_KEY},
@@ -44,6 +46,7 @@ pub enum DecryptError {
 }
 
 /// Decryptor for an fscrypt container.
+#[derive(Debug)]
 pub struct FscryptDecryptor<R> {
     /// The fscrypt file.
     input: R,
@@ -287,5 +290,39 @@ impl<R: Read + Seek> Seek for FscryptDecryptor<R> {
         }
 
         Ok(target_pos)
+    }
+}
+
+impl ReadOffset for FscryptDecryptor<File> {
+    type Err = std::io::Error;
+
+    fn read_at(&self, offset: u64, buffer: &mut [u8]) -> Result<usize, Self::Err> {
+        let start = self.bootid.header_block_count * self.bootid.block_size;
+        let target_index = offset / PAGE_SIZE;
+        let target_offset = offset % PAGE_SIZE;
+        let mut page = [0u8; 4096];
+        let mut page_iv = [0u8; 16];
+        let page_offset = target_index * PAGE_SIZE;
+
+        #[cfg(unix)]
+        std::os::unix::fs::FileExt::read_at(&self.input, &mut page, start + page_offset)?;
+
+        #[cfg(windows)]
+        std::os::windows::fs::FileExt::seek_read(&self.input, &mut page, start + page_offset)?;
+
+        calculate_page_iv(page_offset, &self.iv, &mut page_iv);
+
+        let page_cipher = Aes128CbcDec::new_from_slices(&self.key, &page_iv).unwrap();
+
+        page_cipher
+            .decrypt_padded_mut::<NoPadding>(&mut page)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "failed to decrypt"))?;
+
+        let to_read = std::cmp::min(buffer.len(), (PAGE_SIZE - target_offset) as usize);
+
+        buffer[..to_read]
+            .copy_from_slice(&page[target_offset as usize..target_offset as usize + to_read]);
+
+        Ok(to_read)
     }
 }

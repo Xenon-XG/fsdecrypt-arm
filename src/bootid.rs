@@ -1,4 +1,4 @@
-use std::fmt::Display;
+use std::fmt::{Debug, Display};
 
 use hex_literal::hex;
 
@@ -74,4 +74,31 @@ pub struct BootId {
     pub padding: [u8; 8],
     // We don't need the entire bootID, so keep size down by not including the string table.
     // pub strings: [u8; 10156],
+}
+
+impl Debug for BootId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BootId")
+            .field("crc32", &self.crc32)
+            .field("length", &self.length)
+            .field("signature", &self.signature)
+            .field("unk1", &self.unk1)
+            .field("container_type", &self.container_type)
+            .field("sequence_number", &self.sequence_number)
+            .field("use_custom_iv", &self.use_custom_iv)
+            .field("game_id", &self.game_id)
+            .field("target_timestamp", &self.target_timestamp)
+            //.field("target_version", &self.target_version)
+            .field("block_count", &self.block_count)
+            .field("block_size", &self.block_size)
+            .field("header_block_count", &self.header_block_count)
+            .field("unk2", &self.unk2)
+            .field("os_id", &self.os_id)
+            .field("os_generation", &self.os_generation)
+            .field("source_timestamp", &self.source_timestamp)
+            .field("source_version", &self.source_version)
+            .field("os_version", &self.os_version)
+            .field("padding", &self.padding)
+            .finish()
+    }
 }

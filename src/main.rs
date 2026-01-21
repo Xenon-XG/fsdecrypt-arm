@@ -50,27 +50,46 @@ fn extract_exfat_contents(exfat_path: &Path) -> Result<()> {
     // Create output directory with same name as exfat file (without extension)
     let output_dir = exfat_path.with_extension("");
 
-    let pb = ProgressBar::new_spinner()
-        .with_style(ProgressStyle::default_bar().template("{prefix} {spinner}")?);
-    pb.set_prefix(format!(
-        "Extracting contents of {} to {}",
-        exfat_path.file_name().unwrap().display(),
-        output_dir.display(),
-    ));
-    pb.enable_steady_tick(Duration::from_millis(100));
-
-    let file = File::open(exfat_path)?;
+    let file = FscryptDecryptor::new(File::open(exfat_path)?).map_err(|e| anyhow!(e))?;
     let mut root = Root::open(file)?;
 
+    let pb = ProgressBar::new(calculate_exfat_size(root.items())?)
+        .with_style(
+            ProgressStyle::default_bar().template(
+                "{prefix} [{bar:20!.bright.yellow/dim.white}] {bytes:>8} [{elapsed}<{eta}, {bytes_per_sec}]",
+            )?
+        );
+    pb.set_prefix(format!(
+        "Extracting {}",
+        exfat_path.file_name().unwrap().display(),
+    ));
+
     create_dir_all(&output_dir)?;
-    extract_exfat_elements(root.items(), &output_dir)?;
+    extract_exfat_elements(root.items(), &output_dir, &pb)?;
 
     pb.finish();
 
     Ok(())
 }
 
-fn extract_exfat_elements(elements: &mut [FsElement<File>], output_dir: &Path) -> Result<()> {
+fn calculate_exfat_size(elements: &[FsElement<FscryptDecryptor<File>>]) -> Result<u64> {
+    let mut total = 0;
+
+    for element in elements {
+        match element {
+            FsElement::F(ref file) => total += file.len(),
+            FsElement::D(directory) => total += calculate_exfat_size(&directory.open()?)?,
+        }
+    }
+
+    Ok(total)
+}
+
+fn extract_exfat_elements(
+    elements: &mut [FsElement<FscryptDecryptor<File>>],
+    output_dir: &Path,
+    pb: &ProgressBar,
+) -> Result<()> {
     for element in elements {
         match element {
             FsElement::F(ref mut file) => {
@@ -90,13 +109,15 @@ fn extract_exfat_elements(elements: &mut [FsElement<File>], output_dir: &Path) -
                 let mut writer = BufWriter::with_capacity(256 * 1024, &mut dest);
 
                 std::io::copy(file, &mut writer)?;
+                writer.flush()?;
+                pb.inc(file.len());
             }
             FsElement::D(directory) => {
                 let dest_path = output_dir.join(directory.name());
                 create_dir_all(&dest_path)?;
 
                 let mut children = directory.open()?;
-                extract_exfat_elements(&mut children, &dest_path)?;
+                extract_exfat_elements(&mut children, &dest_path, &pb)?;
             }
         }
     }
@@ -208,7 +229,7 @@ fn main() -> Result<()> {
 
         // Can't directly extract options since we can't impl exfat_fs::dir::ReadOffset
         // for our wrapper decryptor
-        if cli.no_extract || file.bootid.container_type == ContainerType::OPTION {
+        if cli.no_extract {
             let mut output_file = File::create(&output_path)?;
 
             output_file.set_len(file.len())?;
@@ -236,9 +257,9 @@ fn main() -> Result<()> {
 
                 pb.inc(length as u64);
             }
-        }
 
-        if !cli.no_extract {
+            output_file.flush()?;
+        } else {
             match bootid.container_type {
                 ContainerType::OS | ContainerType::APP => {
                     match extract_internal_vhd(&path, bootid.sequence_number) {
@@ -248,12 +269,8 @@ fn main() -> Result<()> {
                         }
                     }
                 }
-                ContainerType::OPTION => match extract_exfat_contents(&output_path) {
-                    Ok(_) => {
-                        println!("Deleting exFAT image: {}", output_path.display());
-
-                        std::fs::remove_file(output_path)?;
-                    }
+                ContainerType::OPTION => match extract_exfat_contents(&path) {
+                    Ok(_) => {}
                     Err(e) => {
                         println!("WARNING: Failed to extract exfat contents: {e:#?}");
                     }
