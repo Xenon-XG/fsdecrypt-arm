@@ -138,7 +138,7 @@ impl<R: Read + Seek> FscryptDecryptor<R> {
         }
 
         let data_offset = bootid.header_block_count * bootid.block_size;
-        let mut page = vec![0u8; PAGE_SIZE as usize];
+        let mut page: Vec<u8> = Vec::with_capacity(PAGE_SIZE as usize);
         let keys = match bootid.container_type {
             ContainerType::OS => get_game_keys(std::str::from_utf8(&bootid.os_id)?),
             ContainerType::APP => get_game_keys(std::str::from_utf8(&bootid.game_id)?),
